@@ -1,0 +1,271 @@
+name: Source — OECD (governance, PMR, digital, corporate governance) - PARQUET OPTIMIZED
+
+description: >
+  Independent Kubeflow/Elyra source component for OECD data.
+  Runs in two modes:
+    1. Production  — downloads oecd_connector.csv from MinIO/B2 → parquet
+    2. Synthetic   — generates synthetic OECD annual data       → parquet (use_synthetic=true)
+  Outputs Snappy-compressed Parquet for fast downstream pipeline consumption.
+
+inputs:
+  - name: countries
+    type: String
+    description: 'Comma-separated ISO3 country codes. Example: "DEU,IND,NLD,NGA,USA"'
+
+  - name: year_start
+    type: Integer
+    description: 'Start year (inclusive) for data range'
+
+  - name: year_end
+    type: Integer
+    description: 'End year (inclusive) for data range'
+
+  - name: use_synthetic
+    type: String
+    description: 'Set to "true" to generate synthetic data instead of downloading from MinIO'
+    default: 'false'
+
+  - name: minio_endpoint
+    type: String
+    default: 'https://s3.us-west-004.backblazeb2.com'
+
+  - name: minio_access_key
+    type: String
+    default: '005775aede18e2e0000000023'
+
+  - name: minio_secret_key
+    type: String
+    default: 'K005GD3X7YxPdbUEtP9mfYwatqf/ugg'
+
+  - name: bucket
+    type: String
+    default: 'holacracydata'
+
+  - name: prefix
+    type: String
+    default: 'connector_output'
+
+outputs:
+  - name: data
+    type: Data
+    description: 'OECD feature data (PARQUET format — Snappy compressed, pyarrow engine)'
+
+  - name: metadata
+    type: Data
+    description: 'Load metadata JSON (source info, row count, columns, file size)'
+
+implementation:
+  container:
+    image: nikhilv215/nesy-factory:v23
+    command:
+      - python3
+      - -u
+      - -c
+      - |
+        import os
+        import sys
+        import json
+        import argparse
+        import logging
+        import time
+        import tempfile
+        import numpy as np
+        import pandas as pd
+
+        logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+        log = logging.getLogger("source_oecd")
+
+        MINIO_FILENAME = "oecd_connector.csv"
+
+
+        def ensure_dir(path):
+            directory = os.path.dirname(path)
+            if directory:
+                os.makedirs(directory, exist_ok=True)
+
+
+        def make_s3_client(endpoint, access_key, secret_key):
+            import boto3
+            from botocore.config import Config as BotoConfig
+            return boto3.client(
+                "s3",
+                endpoint_url=endpoint,
+                aws_access_key_id=access_key,
+                aws_secret_access_key=secret_key,
+                config=BotoConfig(
+                    signature_version="s3v4",
+                    retries={"max_attempts": 5, "mode": "adaptive"},
+                ),
+            )
+
+
+        def save_parquet(df, path):
+            ensure_dir(path)
+            for col in df.columns:
+                if df[col].dtype == object:
+                    sample = df[col].dropna().head(10)
+                    if sample.apply(lambda x: isinstance(x, (list, dict))).any():
+                        df[col] = df[col].apply(
+                            lambda x: json.dumps(x) if isinstance(x, (list, dict)) else x
+                        )
+            df.to_parquet(path, index=False, engine="pyarrow", compression="snappy")
+            size_mb = os.path.getsize(path) / 1e6
+            log.info(f"Saved parquet -> {path} ({len(df)} rows x {len(df.columns)} cols, {size_mb:.2f} MB)")
+            return size_mb
+
+
+        def download_from_minio(endpoint, access_key, secret_key, bucket, prefix, output_path, meta_path):
+            object_key = f"{prefix}/{MINIO_FILENAME}".lstrip("/")
+            log.info(f"Downloading s3://{bucket}/{object_key}")
+
+            s3 = make_s3_client(endpoint, access_key, secret_key)
+
+            with tempfile.NamedTemporaryFile(suffix=".csv", delete=False) as tmp:
+                tmp_path = tmp.name
+            try:
+                t0 = time.time()
+                s3.download_file(bucket, object_key, tmp_path)
+                raw_size = os.path.getsize(tmp_path)
+                log.info(f"Downloaded {raw_size/1e6:.1f} MB in {time.time()-t0:.1f}s")
+                df = pd.read_csv(tmp_path, low_memory=False)
+            finally:
+                if os.path.exists(tmp_path):
+                    os.remove(tmp_path)
+
+            size_mb = save_parquet(df, output_path)
+
+            meta = {
+                "source": "oecd",
+                "mode": "production",
+                "filename": MINIO_FILENAME,
+                "object_key": object_key,
+                "endpoint": endpoint,
+                "bucket": bucket,
+                "rows": len(df),
+                "columns": list(df.columns),
+                "output_path": output_path,
+                "output_size_mb": round(size_mb, 2),
+                "output_format": {
+                    "format": "parquet",
+                    "engine": "pyarrow",
+                    "compression": "snappy"
+                }
+            }
+
+            ensure_dir(meta_path)
+            with open(meta_path, "w") as f:
+                json.dump(meta, f, indent=2)
+
+            return meta
+
+
+        def generate_synthetic(countries, year_start, year_end):
+            rows = []
+            for iso in countries:
+                for yr in range(year_start, year_end + 1):
+                    rows.append({
+                        "location": iso,
+                        "year": yr,
+                        "govt_trust_score":        float(np.random.uniform(20, 70)),
+                        "tax_revenue_pct_gdp":     float(np.random.uniform(15, 45)),
+                        "regulatory_burden":       float(np.random.uniform(1, 5)),
+                        "public_spending_pct_gdp": float(np.random.uniform(20, 55)),
+                        "pmr_overall":             float(np.random.uniform(0.5, 4)),
+                        "state_control_index":     float(np.random.uniform(0.5, 4)),
+                        "state_involvement":       float(np.random.uniform(0.5, 4)),
+                        "barriers_entry":          float(np.random.uniform(0.5, 4)),
+                        "broadband_penetration":   float(np.random.uniform(40, 95)),
+                        "ict_investment_pct_gdp":  float(np.random.uniform(0.5, 5)),
+                        "digital_skills_index":    float(np.random.uniform(30, 80)),
+                        "egovernment_index":       float(np.random.uniform(40, 90)),
+                        "shareholder_rights":      float(np.random.uniform(3, 9)),
+                        "board_independence":      float(np.random.uniform(3, 9)),
+                        "disclosure_quality":      float(np.random.uniform(3, 9)),
+                    })
+
+            df = pd.DataFrame(rows)
+            log.info(f"Generated {len(df)} rows x {len(df.columns)} columns")
+            return df
+
+
+        def main():
+            parser = argparse.ArgumentParser(description="Source component: OECD")
+            parser.add_argument("--countries", required=True)
+            parser.add_argument("--year_start", type=int, required=True)
+            parser.add_argument("--year_end", type=int, required=True)
+            parser.add_argument("--use_synthetic", default="false")
+            parser.add_argument("--minio_endpoint")
+            parser.add_argument("--minio_access_key")
+            parser.add_argument("--minio_secret_key")
+            parser.add_argument("--bucket")
+            parser.add_argument("--prefix")
+            parser.add_argument("--output_data", required=True)
+            parser.add_argument("--output_metadata", required=True)
+
+            args = parser.parse_args()
+
+            use_synthetic = args.use_synthetic.strip().lower() in ("true", "1", "yes")
+
+            if use_synthetic:
+                countries = [c.strip() for c in args.countries.split(",")]
+                df = generate_synthetic(countries, args.year_start, args.year_end)
+                size_mb = save_parquet(df, args.output_data)
+
+                meta = {
+                    "source": "oecd",
+                    "mode": "synthetic",
+                    "countries": countries,
+                    "year_start": args.year_start,
+                    "year_end": args.year_end,
+                    "rows": len(df),
+                    "columns": list(df.columns),
+                    "output_path": args.output_data,
+                    "output_size_mb": round(size_mb, 2),
+                    "output_format": {
+                        "format": "parquet",
+                        "engine": "pyarrow",
+                        "compression": "snappy"
+                    }
+                }
+
+                ensure_dir(args.output_metadata)
+                with open(args.output_metadata, "w") as f:
+                    json.dump(meta, f, indent=2)
+
+            else:
+                download_from_minio(
+                    args.minio_endpoint,
+                    args.minio_access_key,
+                    args.minio_secret_key,
+                    args.bucket,
+                    args.prefix,
+                    args.output_data,
+                    args.output_metadata
+                )
+
+
+        if __name__ == "__main__":
+            main()
+
+      - --countries
+      - {inputValue: countries}
+      - --year_start
+      - {inputValue: year_start}
+      - --year_end
+      - {inputValue: year_end}
+      - --use_synthetic
+      - {inputValue: use_synthetic}
+      - --minio_endpoint
+      - {inputValue: minio_endpoint}
+      - --minio_access_key
+      - {inputValue: minio_access_key}
+      - --minio_secret_key
+      - {inputValue: minio_secret_key}
+      - --bucket
+      - {inputValue: bucket}
+      - --prefix
+      - {inputValue: prefix}
+      - --output_data
+      - {outputPath: data}
+      - --output_metadata
+      - {outputPath: metadata}
